@@ -301,6 +301,81 @@ class GithubClientImpl(token: Secret, config: HttpClientConfig = HttpClientConfi
     )
   end getOrganizationProjectsPage
 
+  // `user(login: ...).organizations`/`.organization(...)` only exposes an organization when the
+  // given user is a *public* member of it. `viewer` bypasses that visibility restriction for the
+  // token owner's own private memberships, so getUserState uses these instead. See #1445.
+  private def getViewerOrganizationsPage(cursor: Option[String]): Future[GraphQLPage[Project.Organization]] =
+    val after = cursor.map(c => s"""after: "$c"""").getOrElse("")
+    val query =
+      s"""|query {
+          |  viewer {
+          |    organizations(first: 100, $after) {
+          |      pageInfo {
+          |        endCursor
+          |        hasNextPage
+          |      }
+          |      nodes {
+          |        login
+          |      }
+          |    }
+          |  }
+          |}""".stripMargin
+    val request = graphqlRequest(query)
+    get[GraphQLPage[Project.Organization]](request)(using graphqlPageDecoder("data", "viewer", "organizations") { d =>
+        d.downField("login").as[String].map(Project.Organization.apply)
+      })
+  end getViewerOrganizationsPage
+
+  private def getViewerRepositoriesPage(cursor: Option[String]): Future[GraphQLPage[RepoWithPermission]] =
+    val after = cursor.map(c => s"""after: "$c"""").getOrElse("")
+    val query =
+      s"""|query {
+          |  viewer {
+          |    repositories(first: 100, $after) {
+          |      pageInfo {
+          |        endCursor
+          |        hasNextPage
+          |      }
+          |      nodes {
+          |        nameWithOwner
+          |        viewerPermission
+          |      }
+          |    }
+          |  }
+          |}
+          |""".stripMargin
+    val request = graphqlRequest(query)
+    get[GraphQLPage[RepoWithPermission]](request)(using graphqlPageDecoder("data", "viewer", "repositories"))
+  end getViewerRepositoriesPage
+
+  private def getViewerOrganizationRepositoriesPage(organization: Project.Organization)(
+      cursor: Option[String]
+  ): Future[GraphQLPage[RepoWithPermission]] =
+    val after = cursor.map(c => s"""after: "$c"""").getOrElse("")
+    val query =
+      s"""|query {
+          |  viewer {
+          |    organization(login: "$organization") {
+          |      repositories(first: 100, $after) {
+          |        pageInfo {
+          |          endCursor
+          |          hasNextPage
+          |        }
+          |        nodes {
+          |          nameWithOwner
+          |          viewerPermission
+          |        }
+          |      }
+          |    }
+          |  }
+          |}
+          |""".stripMargin
+    val request = graphqlRequest(query)
+    get[GraphQLPage[RepoWithPermission]](request)(
+      using graphqlPageDecoder("data", "viewer", "organization", "repositories")
+    )
+  end getViewerOrganizationRepositoriesPage
+
   private def getAllRecursively[T](f: Option[String] => Future[GraphQLPage[T]]): Future[Seq[T]] =
     def recurse(cursor: Option[String], acc: Seq[T]): Future[Seq[T]] =
       for
@@ -320,10 +395,16 @@ class GithubClientImpl(token: Secret, config: HttpClientConfig = HttpClientConfi
 
   private def getUserState(userInfo: UserInfo): Future[UserState] =
     val permissions = Seq("WRITE", "MAINTAIN", "ADMIN")
+    def filterByPermission(repos: Seq[RepoWithPermission]): Seq[Project.Reference] =
+      repos
+        .filter(repo => permissions.contains(repo.viewerPermission))
+        .map(repo => Project.Reference.unsafe(repo.nameWithOwner))
     for
-      organizations <- getUserOrganizations(userInfo.login)
-      organizationRepos <- organizations.flatMapSync(getOrganizationRepositories(userInfo.login, _, permissions))
-      userRepos <- getUserRepositories(userInfo.login, permissions)
+      organizations <- getAllRecursively(getViewerOrganizationsPage)
+      organizationRepos <- organizations.flatMapSync(org =>
+        getAllRecursively(getViewerOrganizationRepositoriesPage(org)).map(filterByPermission)
+      )
+      userRepos <- getAllRecursively(getViewerRepositoriesPage).map(filterByPermission)
     yield UserState(repos = organizationRepos.toSet ++ userRepos, orgs = organizations.toSet, info = userInfo)
 
   def getUserInfo(): Future[GithubResponse[UserInfo]] =
