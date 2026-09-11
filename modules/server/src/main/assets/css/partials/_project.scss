@@ -59,8 +59,13 @@
     margin-bottom: 30px;
   }
 
-  .dependencies,
-  .dependents {
+  // .dependencies is the small box on the Project/Artifact page sidebar - it
+  // needs its own clipping context to keep long names contained.
+  // .dependents is the full-width, paginated Dependents tab: it lives in a
+  // .content-project box that uses the tab-overlap negative-margin trick, and
+  // adding overflow: hidden there caused inconsistent clipping of that overlap
+  // across browsers, showing as a gap under the active tab in Firefox/Chrome.
+  .dependencies {
     overflow: hidden;
     .row {
       > div {
@@ -68,6 +73,10 @@
         word-break: break-word;
       }
     }
+  }
+
+  .dependencies,
+  .dependents {
     span {
       i {
         font-size: 14px;
